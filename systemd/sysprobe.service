@@ -1,0 +1,11 @@
+[Unit]
+Description=Sample CPU/memory/load/temperature every 5 seconds to a log
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sysprobe --loop --interval 5
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

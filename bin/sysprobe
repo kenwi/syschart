@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+#
+# sysprobe - sample CPU usage, memory/swap usage (% and used MiB), load
+# average and CPU temperature, appending one tab-separated line to a log file.
+#
+#   sysprobe --once                 append a single sample
+#   sysprobe --loop [--interval N]  sample forever (used by the systemd service)
+#
+# Env overrides:
+#   SYSPROBE_FILE       log path (default ~/.local/state/sysprobe/sys.log)
+#   SYSPROBE_INTERVAL   seconds between samples (default 5)
+set -euo pipefail
+
+LOG="${SYSPROBE_FILE:-${XDG_STATE_HOME:-$HOME/.local/state}/sysprobe/sys.log}"
+INTERVAL="${SYSPROBE_INTERVAL:-5}"
+MODE=once
+STATE="$(dirname "$LOG")/.cpu_prev"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --once) MODE=once; shift ;;
+        --loop) MODE=loop; shift ;;
+        --interval)
+            INTERVAL="$2"; shift 2 ;;
+        *) echo "sysprobe: unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
+
+if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || [[ "$INTERVAL" -lt 1 ]]; then
+    echo "sysprobe: invalid interval: $INTERVAL" >&2
+    exit 1
+fi
+
+# CPU% needs two readings; cumulative counters are persisted between probes.
+cpu_pct() {
+    local rest f idle total p_idle p_total d_idle d_total
+    read -r _ rest < /proc/stat
+    f=($rest)
+    idle=$(( f[3] + f[4] ))
+    total=0
+    local v
+    for v in "${f[@]}"; do total=$(( total + v )); done
+
+    if [[ -f "$STATE" ]]; then
+        read -r p_idle p_total < "$STATE"
+        d_idle=$(( idle - p_idle ))
+        d_total=$(( total - p_total ))
+        [[ $d_total -lt 1 ]] && d_total=1
+        awk -v i="$d_idle" -v t="$d_total" 'BEGIN { printf "%.1f", (1 - i/t) * 100 }'
+    else
+        # First sample ever: utilization averaged since boot.
+        awk -v i="$idle" -v t="$total" 'BEGIN { printf "%.1f", (1 - i/t) * 100 }'
+    fi
+    echo "$idle $total" > "$STATE"
+}
+
+mem_pct() {
+    awk '/^MemTotal:/ { t=$2 } /^MemAvailable:/ { a=$2 }
+         END { if (t > 0) printf "%.1f", (1 - a/t) * 100; else print "0.0" }' /proc/meminfo
+}
+
+swap_pct() {
+    awk '/^SwapTotal:/ { t=$2 } /^SwapFree:/ { f=$2 }
+         END { if (t > 0) printf "%.1f", (1 - f/t) * 100; else print "0.0" }' /proc/meminfo
+}
+
+mem_used_mib() {
+    awk '/^MemTotal:/ { t=$2 } /^MemAvailable:/ { a=$2 }
+         END { if (t > 0) printf "%.0f", (t - a)/1024; else print "0" }' /proc/meminfo
+}
+
+swap_used_mib() {
+    awk '/^SwapTotal:/ { t=$2 } /^SwapFree:/ { f=$2 }
+         END { if (t > 0) printf "%.0f", (t - f)/1024; else print "0" }' /proc/meminfo
+}
+
+load1() {
+    awk '{ print $1 }' /proc/loadavg
+}
+
+probe_temp() {
+    local t v max=0 name typ
+    for t in /sys/class/hwmon/hwmon*/temp*_input; do
+        [[ -r "$t" ]] || continue
+        name=$(<"${t%/*}/name")
+        case "$name" in
+            coretemp|k10temp|zenpower|cpu_thermal|soc_thermal)
+                v=$(<"$t")
+                if (( v > max )); then max=$v; fi ;;
+        esac
+    done
+    if (( max == 0 )); then
+        for z in /sys/class/thermal/thermal_zone*; do
+            [[ -r "$z/type" && -r "$z/temp" ]] || continue
+            typ=$(<"$z/type")
+            case "$typ" in
+                *cpu*|x86_pkg_temp)
+                    v=$(<"$z/temp")
+                    if (( v > max )); then max=$v; fi ;;
+            esac
+        done
+    fi
+    if (( max > 0 )); then
+        awk -v m="$max" 'BEGIN { printf "%.0f", m/1000 }'
+    fi
+}
+
+probe() {
+    local ts cpu mem swap load temp memu swapu
+    ts=$(date +%Y-%m-%dT%H:%M:%S)
+    cpu=$(cpu_pct)
+    mem=$(mem_pct)
+    swap=$(swap_pct)
+    load=$(load1)
+    temp=$(probe_temp)
+    memu=$(mem_used_mib)
+    swapu=$(swap_used_mib)
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$ts" "$cpu" "$mem" "$swap" "$load" "${temp:-}" "$memu" "$swapu"
+}
+
+mkdir -p "$(dirname "$LOG")"
+if [[ ! -f "$LOG" ]]; then
+    printf '#timestamp\tcpu_pct\tmem_pct\tswap_pct\tload1\ttemp_c\tmem_used_mib\tswap_used_mib\n' > "$LOG"
+fi
+
+if [[ "$MODE" == once ]]; then
+    probe >> "$LOG"
+    exit 0
+fi
+
+while true; do
+    probe >> "$LOG"
+    now=$(date +%s)
+    next=$(( (now / INTERVAL + 1) * INTERVAL ))
+    wait=$(( next - now ))
+    [[ $wait -lt 0 ]] && wait=0
+    sleep "$wait"
+done

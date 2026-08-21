@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""syschart - draw terminal charts of logged system usage.
+
+Usage:
+  syschart                last 60 minutes: CPU % and memory usage
+  syschart --since 15m    last 15 minutes
+  syschart --all          entire log
+  syschart --absolute     show memory/swap as used MiB/GiB instead of %
+  syschart --swap         also show swap usage
+  syschart --load         also show 1-minute load average
+  syschart --temp         also show CPU temperature
+  syschart --png [FILE]   also render a PNG via matplotlib
+  syschart --theme dark   dark plot background (works with --png / --show)
+  syschart --show         open an interactive matplotlib window (hover to
+                          probe exact values at a given time)
+
+The log is written by the sysprobe systemd service (or `sysprobe --once`).
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import os
+import shutil
+import subprocess
+import sys
+
+BARS = "▁▂▃▄▅▆▇█"
+
+DEFAULT_LOG = os.path.expanduser("~/.local/state/sysprobe/sys.log")
+
+
+def fmt_mib(v: float) -> str:
+    return f"{v:.0f}MiB" if v < 1024 else f"{v/1024:.1f}GiB"
+
+
+# column index in the TSV log, terminal label, number format (str template or
+# callable), matplotlib y-axis label. Mem/swap exist in a % and an absolute
+# variant; which one is shown follows --absolute.
+SERIES = {
+    "cpu":   dict(col=1, label="CPU %", fmt="{:.1f}",
+                  ylabel="CPU %"),
+    "mem":   dict(col=2, label="Mem %", fmt="{:.1f}",
+                  ylabel="Memory %"),
+    "memu":  dict(col=6, label="Mem used", fmt=fmt_mib,
+                  ylabel="Memory used (MiB)"),
+    "swap":  dict(col=3, label="Swap %", fmt="{:.1f}",
+                  ylabel="Swap %"),
+    "swapu": dict(col=7, label="Swap used", fmt=fmt_mib,
+                  ylabel="Swap used (MiB)"),
+    "load":  dict(col=4, label="Load", fmt="{:.2f}",
+                  ylabel="Load (1m)"),
+    "temp":  dict(col=5, label="Temp °C", fmt="{:.0f}",
+                  ylabel="CPU temperature (°C)"),
+}
+
+THEMES = {
+    "light": dict(
+        bg="#ffffff", grid="#d9d9d9", text="#111111",
+        cpu="#1f6feb", mem="#0e8a16", memu="#0e8a16",
+        swap="#8250df", swapu="#8250df",
+        load="#bf8700", temp="#cf222e",
+    ),
+    "dark": dict(
+        bg="#1a1b26", grid="#2c2e42", text="#c0caf5",
+        cpu="#7aa2f7", mem="#9ece6a", memu="#9ece6a",
+        swap="#bb9af7", swapu="#bb9af7",
+        load="#e0af68", temp="#f7768e",
+    ),
+}
+
+
+def parse_window(s: str) -> datetime.timedelta:
+    unit = s[-1]
+    try:
+        n = float(s[:-1])
+    except ValueError:
+        raise SystemExit(f"invalid --since value: {s!r} (use e.g. 15m, 2h)")
+    if unit == "s":
+        return datetime.timedelta(seconds=n)
+    if unit == "m":
+        return datetime.timedelta(minutes=n)
+    if unit == "h":
+        return datetime.timedelta(hours=n)
+    raise SystemExit(f"invalid --since value: {s!r} (use e.g. 15m, 2h)")
+
+
+def load(path: str):
+    rows = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 6:
+                continue
+            try:
+                t = datetime.datetime.fromisoformat(parts[0])
+            except ValueError:
+                continue
+            # logs written before the mem/swap absolute columns exist only
+            # have 6 fields; missing values stay None
+            vals = [None] * 7
+            for j, p in enumerate(parts[1:8]):
+                try:
+                    vals[j] = float(p)
+                except ValueError:
+                    pass
+            rows.append((t, *vals))
+    return rows
+
+
+def sparkline(values, width: int) -> str:
+    samples = [v for v in values if v is not None]
+    n = len(samples)
+    if n == 0:
+        return ""
+    if n > width:
+        step = n / width
+        buckets = [samples[int(i * step) : int((i + 1) * step)] for i in range(width)]
+        samples = [sum(b) / len(b) for b in buckets]
+    lo, hi = min(samples), max(samples)
+    rng = hi - lo
+    out = []
+    for v in samples:
+        if rng == 0:
+            out.append(BARS[3])
+        else:
+            out.append(BARS[round((v - lo) / rng * (len(BARS) - 1))])
+    return "".join(out)
+
+
+def fmt_value(fmt, v) -> str:
+    return fmt(v) if callable(fmt) else fmt.format(v)
+
+
+def stats_line(name: str, values, fmt) -> str:
+    vs = [v for v in values if v is not None]
+    cur_s = "n/a" if not vs or vs[-1] is None else fmt_value(fmt, vs[-1])
+    head = f"{name:<{LABEL_W}}  now {cur_s:>7}  "
+    if not vs:
+        return head.rstrip()
+    avg = sum(vs) / len(vs)
+    return (
+        head + sparkline(vs, BAR_WIDTH) + "  "
+        f"peak {fmt_value(fmt, max(vs))} / avg {fmt_value(fmt, avg)} / min {fmt_value(fmt, min(vs))}"
+    )
+
+
+def main() -> None:
+    global BAR_WIDTH, LABEL_W
+
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--since", default="60m", metavar="30m", help="window (default 60m)")
+    ap.add_argument("--all", action="store_true", help="chart the entire log")
+    ap.add_argument("--absolute", action="store_true",
+                    help="show memory/swap as used MiB/GiB instead of %%")
+    ap.add_argument("--swap", action="store_true", help="also plot swap usage")
+    ap.add_argument("--load", action="store_true", help="also plot 1-minute load average")
+    ap.add_argument("--temp", action="store_true", help="also plot CPU temperature")
+    ap.add_argument("--png", nargs="?", const="/tmp/syschart.png", metavar="FILE",
+                    help="also render a PNG")
+    ap.add_argument("--show", action="store_true",
+                    help="open an interactive matplotlib window to probe exact values")
+    ap.add_argument("--theme", default="light", choices=sorted(THEMES),
+                    help="plot color theme (default light)")
+    ap.add_argument("--log", default=os.environ.get("SYSPROBE_FILE", DEFAULT_LOG),
+                    help="log file to read")
+    args = ap.parse_args()
+
+    mem_key, swap_key = ("memu", "swapu") if args.absolute else ("mem", "swap")
+    visible = ["cpu", mem_key]
+    if args.swap:
+        visible.append(swap_key)
+    if args.load:
+        visible.append("load")
+    if args.temp:
+        visible.append("temp")
+
+    if not os.path.exists(args.log):
+        sys.exit(f"no log at {args.log} — start the service: systemctl --user enable --now sysprobe")
+
+    rows = load(args.log)
+    if not rows:
+        sys.exit("log is empty — waiting for the first sample")
+
+    now = datetime.datetime.now()
+    window = None
+    if not args.all:
+        window = parse_window(args.since)
+        rows = [r for r in rows if now - r[0] <= window]
+
+    if not rows:
+        sys.exit("no samples in the requested window yet")
+
+    times = [r[0] for r in rows]
+
+    cols = shutil.get_terminal_size().columns or 80
+    BAR_WIDTH = max(20, cols - 44)
+    LABEL_W = max(len(SERIES[k]["label"]) for k in visible)
+
+    span = window if not args.all else times[-1] - times[0]
+    print(f"System usage — {span}  ({len(rows)} samples)")
+    for key in visible:
+        s = SERIES[key]
+        print(stats_line(s["label"], [r[s["col"]] for r in rows], s["fmt"]))
+    indent = LABEL_W + len("  now ") + 7 + 2
+    print(f"{'':>{indent}}{times[0].strftime('%H:%M:%S'):<{BAR_WIDTH}}{times[-1].strftime('%H:%M:%S')}")
+
+    if args.png or args.show:
+        try:
+            import matplotlib
+        except ImportError:
+            sys.exit("matplotlib not installed — plotting unavailable")
+
+        if args.png and not args.show:
+            matplotlib.use("Agg")
+
+        import matplotlib.dates as mdates
+        import matplotlib.pyplot as plt
+
+        t = THEMES[args.theme]
+        plt.rcParams.update({
+            "figure.facecolor": t["bg"],
+            "axes.facecolor": t["bg"],
+            "axes.edgecolor": t["text"],
+            "axes.labelcolor": t["text"],
+            "xtick.color": t["text"],
+            "ytick.color": t["text"],
+            "text.color": t["text"],
+            "grid.color": t["grid"],
+        })
+
+        n = len(visible)
+        fig, axes = plt.subplots(n, 1, figsize=(12, max(3.0, 1.9 * n)),
+                                 sharex=True, squeeze=False)
+        axes = axes.ravel()
+
+        series_data = {}
+        for ax, key in zip(axes, visible):
+            s = SERIES[key]
+            ys = [float("nan") if v is None else v for v in (r[s["col"]] for r in rows)]
+            ylabel = s["ylabel"]
+            if key in ("memu", "swapu"):
+                # switch to GiB when the range makes MiB unreadable
+                finite = [y for y in ys if y == y]
+                if finite and max(finite) >= 8 * 1024:
+                    ys = [y / 1024 for y in ys]
+                    ylabel = ylabel.replace("MiB", "GiB")
+            series_data[key] = ys
+            ax.plot(times, ys, color=t[key], lw=1.2)
+            ax.set_ylabel(ylabel)
+            ax.grid(alpha=0.3)
+        axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+        def fmt_val(key, v):
+            if v is None or v != v:
+                return f"{SERIES[key]['label']} n/a"
+            return f"{SERIES[key]['label']} {fmt_value(SERIES[key]['fmt'], v)}"
+
+        annot = axes[0].annotate(
+            "", xy=(0, 0), xytext=(12, 12), textcoords="offset points",
+            bbox=dict(boxstyle="round", fc=t["bg"], ec=t["grid"], alpha=0.95),
+            color=t["text"], fontsize=9,
+        )
+        annot.set_visible(False)
+
+        def on_move(event):
+            if event.inaxes not in axes or event.xdata is None:
+                annot.set_visible(False)
+                fig.canvas.draw_idle()
+                return
+            i = min(range(len(times)), key=lambda j: abs(mdates.date2num(times[j]) - event.xdata))
+            annot.xy = (mdates.date2num(times[i]), series_data[visible[0]][i])
+            lines = [times[i].strftime("%Y-%m-%d %H:%M:%S")]
+            lines += [fmt_val(k, rows[i][SERIES[k]["col"]]) for k in visible]
+            annot.set_text("\n".join(lines))
+            annot.set_visible(True)
+            fig.canvas.draw_idle()
+
+        fig.canvas.mpl_connect("motion_notify_event", on_move)
+        fig.tight_layout()
+
+    if args.png:
+        fig.savefig(args.png, dpi=150)
+        print(f"PNG written to {args.png}")
+        if not args.show and ("DISPLAY" in os.environ or "WAYLAND_DISPLAY" in os.environ):
+            subprocess.Popen(["xdg-open", args.png])
+
+    if args.show:
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()
