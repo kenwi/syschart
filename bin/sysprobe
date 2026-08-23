@@ -36,22 +36,42 @@ cpu_pct() {
     local rest f idle total p_idle p_total d_idle d_total
     read -r _ rest < /proc/stat
     f=($rest)
+    # guest and guest_nice are already included in user/nice; sum only the
+    # first eight fields.
     idle=$(( f[3] + f[4] ))
     total=0
-    local v
-    for v in "${f[@]}"; do total=$(( total + v )); done
+    local k limit=${#f[@]}
+    (( limit > 8 )) && limit=8
+    for (( k = 0; k < limit; k++ )); do total=$(( total + f[k] )); done
 
+    local have_prev=0
     if [[ -f "$STATE" ]]; then
-        read -r p_idle p_total < "$STATE"
+        read -r p_idle p_total < "$STATE" || true
+        # Only trust fully-numeric values; a torn or corrupted state file
+        # would otherwise blow up in arithmetic under set -u.
+        if [[ ${p_idle:-} =~ ^[0-9]+$ && ${p_total:-} =~ ^[0-9]+$ ]]; then
+            have_prev=1
+        fi
+    fi
+
+    if (( have_prev )); then
         d_idle=$(( idle - p_idle ))
         d_total=$(( total - p_total ))
-        [[ $d_total -lt 1 ]] && d_total=1
+        # Counters must advance monotonically and idle can never exceed the
+        # total. Anything else means a stale/racing probe wrote the state:
+        # skip the sample instead of logging nonsense.
+        if (( d_total <= 0 || d_idle < 0 || d_idle > d_total )); then
+            return 1
+        fi
         awk -v i="$d_idle" -v t="$d_total" 'BEGIN { printf "%.1f", (1 - i/t) * 100 }'
     else
-        # First sample ever: utilization averaged since boot.
+        # First sample ever (or unusable prior state): utilization averaged
+        # since boot; always within 0..100.
         awk -v i="$idle" -v t="$total" 'BEGIN { printf "%.1f", (1 - i/t) * 100 }'
     fi
-    echo "$idle $total" > "$STATE"
+    # Atomic replace so a concurrent reader never sees a half-written line.
+    printf '%s\n' "$idle $total" > "$STATE.tmp"
+    mv -f "$STATE.tmp" "$STATE"
 }
 
 mem_pct() {
@@ -108,7 +128,7 @@ probe_temp() {
 probe() {
     local ts cpu mem swap load temp memu swapu
     ts=$(date +%Y-%m-%dT%H:%M:%S)
-    cpu=$(cpu_pct)
+    cpu=$(cpu_pct) || return 1
     mem=$(mem_pct)
     swap=$(swap_pct)
     load=$(load1)
@@ -125,12 +145,14 @@ if [[ ! -f "$LOG" ]]; then
 fi
 
 if [[ "$MODE" == once ]]; then
-    probe >> "$LOG"
+    probe >> "$LOG" || true
     exit 0
 fi
 
 while true; do
-    probe >> "$LOG"
+    # A skipped sample (counter sanity check failed) just means no row this
+    # tick; the next interval recomputes against the refreshed state.
+    probe >> "$LOG" || true
     now=$(date +%s)
     next=$(( (now / INTERVAL + 1) * INTERVAL ))
     wait=$(( next - now ))
