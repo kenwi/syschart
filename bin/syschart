@@ -191,10 +191,15 @@ def main() -> None:
     window = None
     if not args.all:
         window = parse_window(args.since)
-        rows = [r for r in rows if now - r[0] <= window]
-
-    if not rows:
-        sys.exit("no samples in the requested window yet")
+        filtered = [r for r in rows if now - r[0] <= window]
+        if not filtered:
+            latest = rows[-1][0]
+            age = now - latest
+            sys.exit(
+                f"no samples in the last {args.since} (latest is {age} old at "
+                f"{latest:%Y-%m-%d %H:%M:%S}) — is sysprobe running?"
+            )
+        rows = filtered
 
     times = [r[0] for r in rows]
 

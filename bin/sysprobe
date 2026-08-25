@@ -58,12 +58,13 @@ cpu_pct() {
         d_idle=$(( idle - p_idle ))
         d_total=$(( total - p_total ))
         # Counters must advance monotonically and idle can never exceed the
-        # total. Anything else means a stale/racing probe wrote the state:
-        # skip the sample instead of logging nonsense.
-        if (( d_total <= 0 || d_idle < 0 || d_idle > d_total )); then
-            return 1
+        # total. Backward jumps mean reboot or a torn state file - fall back
+        # to utilization since boot and refresh state below.
+        if (( d_total > 0 && d_idle >= 0 && d_idle <= d_total )); then
+            awk -v i="$d_idle" -v t="$d_total" 'BEGIN { printf "%.1f", (1 - i/t) * 100 }'
+        else
+            awk -v i="$idle" -v t="$total" 'BEGIN { printf "%.1f", (1 - i/t) * 100 }'
         fi
-        awk -v i="$d_idle" -v t="$d_total" 'BEGIN { printf "%.1f", (1 - i/t) * 100 }'
     else
         # First sample ever (or unusable prior state): utilization averaged
         # since boot; always within 0..100.
