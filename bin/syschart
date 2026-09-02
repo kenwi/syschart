@@ -10,6 +10,8 @@ Usage:
   syschart --load         also show 1-minute load average
   syschart --temp         also show CPU temperature
   syschart --png [FILE]   also render a PNG via matplotlib
+  syschart --size 875x600 fixed pixel size for --png / --show (default scales
+                          with panel count: 1800px wide @ 150 dpi)
   syschart --theme dark   dark plot background (works with --png / --show)
   syschart --show         open an interactive matplotlib window (hover to
                           probe exact values at a given time)
@@ -83,6 +85,19 @@ def parse_window(s: str) -> datetime.timedelta:
     if unit == "h":
         return datetime.timedelta(hours=n)
     raise SystemExit(f"invalid --since value: {s!r} (use e.g. 15m, 2h)")
+
+
+def parse_size(s: str) -> tuple[int, int]:
+    parts = s.lower().replace("*", "x").split("x")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(f"invalid --size {s!r} (use e.g. 875x600)")
+    try:
+        w, h = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid --size {s!r} (use e.g. 875x600)")
+    if w < 1 or h < 1:
+        raise argparse.ArgumentTypeError(f"invalid --size {s!r}: width and height must be >= 1")
+    return w, h
 
 
 def load(path: str):
@@ -163,6 +178,9 @@ def main() -> None:
     ap.add_argument("--temp", action="store_true", help="also plot CPU temperature")
     ap.add_argument("--png", nargs="?", const="/tmp/syschart.png", metavar="FILE",
                     help="also render a PNG")
+    ap.add_argument("--size", type=parse_size, metavar="WxH",
+                    help="fixed pixel size for --png / --show (e.g. 875x600); "
+                         "default is 12in wide with height scaled to panel count @ 150 dpi")
     ap.add_argument("--show", action="store_true",
                     help="open an interactive matplotlib window to probe exact values")
     ap.add_argument("--theme", default="light", choices=sorted(THEMES),
@@ -240,8 +258,16 @@ def main() -> None:
         })
 
         n = len(visible)
-        fig, axes = plt.subplots(n, 1, figsize=(12, max(3.0, 1.9 * n)),
-                                 sharex=True, squeeze=False)
+        if args.size:
+            # Fixed pixel size: inches * dpi = pixels
+            png_dpi = 100
+            figsize = (args.size[0] / png_dpi, args.size[1] / png_dpi)
+        else:
+            # Original default: 12in wide, height scales with panel count @ 150 dpi
+            # (e.g. 2 panels -> 1800x570)
+            png_dpi = 150
+            figsize = (12, max(3.0, 1.9 * n))
+        fig, axes = plt.subplots(n, 1, figsize=figsize, sharex=True, squeeze=False)
         axes = axes.ravel()
 
         series_data = {}
@@ -290,7 +316,7 @@ def main() -> None:
         fig.tight_layout()
 
     if args.png:
-        fig.savefig(args.png, dpi=150)
+        fig.savefig(args.png, dpi=png_dpi)
         print(f"PNG written to {args.png}")
         if not args.show and ("DISPLAY" in os.environ or "WAYLAND_DISPLAY" in os.environ):
             subprocess.Popen(["xdg-open", args.png])

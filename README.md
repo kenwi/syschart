@@ -13,7 +13,7 @@ userspace with no root required.
   load 1m, CPU temp
 - Terminal charts with Unicode bars — no extra dependencies
 - Interactive matplotlib window to probe exact values at a given time (`--show`)
-- Optional PNG export
+- Optional PNG export (default ~1800px wide; override with `--size WxH`)
 - No root required; everything runs in userspace
 
 ## Requirements
@@ -87,6 +87,7 @@ syschart --temp          # also show CPU temperature
 syschart --show          # interactive window; hover to probe exact values
 syschart --png           # render PNG to /tmp/syschart.png and open it
 syschart --png ~/p.png   # PNG to a custom path
+syschart --size 875x600  # fixed pixel size for --png / --show
 syschart --theme dark    # dark plot background (also works with --show)
 syschart --help          # all options
 ```
@@ -130,7 +131,7 @@ systemctl --user daemon-reload && systemctl --user restart sysprobe
 ### Keybinding (Hyprland example)
 
 ```conf
-bindd = SUPER, M, System chart (PNG), exec, /home/you/.local/bin/syschart --png --temp --load
+bindd = SUPER, M, System chart (PNG 875x600), exec, /home/you/.local/bin/syschart --png --size 875x600 --temp --load
 ```
 
 ## Uninstall
